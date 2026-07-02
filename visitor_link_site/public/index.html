@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Deal Picks</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="topbar" aria-label="Store overview">
+        <div>
+          <p class="eyebrow">Curated links</p>
+          <h1>Deal Picks</h1>
+        </div>
+        <div class="status" id="trackingStatus">Analytics off</div>
+      </section>
+
+      <section class="notice" aria-label="Privacy notice">
+        <strong>Privacy notice:</strong>
+        This page can send the site owner a consented visit/click alert with browser, device, referrer, IP-based approximate location, optional precise location, and email only if you share it.
+      </section>
+
+      <section class="consent-panel" id="consentPanel" aria-label="Consent controls">
+        <div>
+          <h2>Analytics permission</h2>
+          <p>Choose whether this site may send visit and product-click analytics to the owner. Email is optional and only sent if entered here.</p>
+        </div>
+        <label class="field-row">
+          <span>Email for identity</span>
+          <input type="email" id="visitorEmail" autocomplete="email" placeholder="you@example.com" />
+        </label>
+        <label class="check-row">
+          <input type="checkbox" id="preciseLocation" />
+          <span>Ask browser for precise location too</span>
+        </label>
+        <div class="actions">
+          <button class="primary" id="allowTracking">Allow analytics</button>
+          <button class="secondary" id="skipTracking">Continue without analytics</button>
+        </div>
+      </section>
+
+      <section class="grid" aria-label="Product links">
+        <article class="product">
+          <div class="badge">Amazon</div>
+          <h2>Wireless Earbuds</h2>
+          <p>Compact earbuds with charging case and quick pairing.</p>
+          <button data-title="Wireless Earbuds" data-url="https://www.amazon.in/s?k=wireless+earbuds">Open deal</button>
+        </article>
+
+        <article class="product">
+          <div class="badge flipkart">Flipkart</div>
+          <h2>Smart Watch</h2>
+          <p>Daily fitness tracking, notifications, and long battery life.</p>
+          <button data-title="Smart Watch" data-url="https://www.flipkart.com/search?q=smart+watch">Open deal</button>
+        </article>
+
+        <article class="product">
+          <div class="badge">Amazon</div>
+          <h2>Laptop Backpack</h2>
+          <p>Everyday laptop bag with organizer pockets and water resistance.</p>
+          <button data-title="Laptop Backpack" data-url="https://www.amazon.in/s?k=laptop+backpack">Open deal</button>
+        </article>
+
+        <article class="product">
+          <div class="badge flipkart">Flipkart</div>
+          <h2>Bluetooth Speaker</h2>
+          <p>Portable speaker picks for home, travel, and small gatherings.</p>
+          <button data-title="Bluetooth Speaker" data-url="https://www.flipkart.com/search?q=bluetooth+speaker">Open deal</button>
+        </article>
+      </section>
+    </main>
+
+    <script src="/app.js"></script>
+  </body>
+</html>

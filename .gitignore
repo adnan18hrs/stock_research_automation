@@ -1,0 +1,19 @@
+.DS_Store
+.env
+.env.*
+!.env.example
+
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+# Generated research corpus. This can become many GB, so keep it local.
+data/*
+!data/README.md
+!data/.gitkeep
+
+# Runtime logs, trading state, downloaded instrument cache, and visitor events.
+logs/*
+!logs/.gitkeep
+visitor_link_site/data/
