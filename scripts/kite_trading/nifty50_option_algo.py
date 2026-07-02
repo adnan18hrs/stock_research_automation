@@ -7,9 +7,10 @@ Signal rules:
   sell -> buy the nearest NIFTY PE strike below spot, rounded to 100.
 
 Risk management:
-  - At +5% option LTP, exit half the quantity.
+  - Initial stop loss is 5% below entry.
+  - At +10% option LTP, exit half the quantity.
   - Move remaining stop loss to entry price.
-  - Trail the remaining stop by half of the option's move from entry.
+  - Trail the remaining stop by 2/3 of the extra move above the +10% trigger.
 
 The script is dry-run by default. Live orders require both:
   --execute --i-understand-live-risk
@@ -567,7 +568,7 @@ def load_position(state_file: Path) -> ManagedPosition:
     data = json.loads(state_file.read_text())
     entry_price = float(data["entry_price"])
     profit_trigger_pct = float(data.get("profit_trigger_pct", 0.10))
-    initial_stop_loss_pct = float(data.get("initial_stop_loss_pct", 0.10))
+    initial_stop_loss_pct = float(data.get("initial_stop_loss_pct", 0.05))
     data.setdefault("profit_trigger_pct", profit_trigger_pct)
     data.setdefault("initial_stop_loss_pct", initial_stop_loss_pct)
     data.setdefault("initial_stop_loss", round_price(entry_price * (1 - initial_stop_loss_pct)))
@@ -881,12 +882,12 @@ def manage_position(args: argparse.Namespace, position: Optional[ManagedPosition
 
         if position.partial_exit_done:
             extra_move_after_trigger = max(0.0, position.highest_ltp - trigger_price)
-            trailed_stop = position.entry_price + extra_move_after_trigger / 2.0
+            trailed_stop = position.entry_price + (extra_move_after_trigger * 2.0 / 3.0)
             old_stop_loss = position.stop_loss
             position.stop_loss = max(position.stop_loss or position.entry_price, trailed_stop)
             if old_stop_loss is None or position.stop_loss > old_stop_loss:
                 LOG.info(
-                    "Trailing stop updated: old_sl=%s new_sl=%.2f highest_ltp=%.2f trigger_price=%.2f extra_move_after_trigger=%.2f",
+                    "Trailing stop updated: old_sl=%s new_sl=%.2f highest_ltp=%.2f trigger_price=%.2f extra_move_after_trigger=%.2f trail_ratio=0.67",
                     "-" if old_stop_loss is None else f"{old_stop_loss:.2f}",
                     position.stop_loss,
                     position.highest_ltp,
@@ -978,7 +979,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Market protection for MARKET orders. -1 means Kite auto protection; custom percent can be 0-100.",
     )
     parser.add_argument("--profit-trigger-pct", type=float, default=0.10, help="Partial exit trigger. Default 0.10 means +10%%.")
-    parser.add_argument("--initial-stop-loss-pct", type=float, default=0.10, help="Initial SL below entry. Default 0.10 means -10%%.")
+    parser.add_argument("--initial-stop-loss-pct", type=float, default=0.05, help="Initial SL below entry. Default 0.05 means -5%%.")
     parser.add_argument("--poll-seconds", type=float, default=3.0)
     parser.add_argument("--order-timeout", type=int, default=20)
     parser.add_argument("--force-exit-time", type=parse_hhmm, default=parse_hhmm("15:25"), help="Exit open position at/after HH:MM IST. Default 15:25.")

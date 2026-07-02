@@ -26,10 +26,10 @@ Logs and state are still stored in:
 Risk rules in `nifty50_option_algo.py`:
 
 - Always buys exactly 2 lots for `1` / `2` signals.
-- Initial stop loss is 10% below entry; if hit before target, both lots exit.
+- Initial stop loss is 5% below entry; if hit before target, both lots exit.
 - At +10% option profit, 1 lot exits.
 - Remaining 1 lot stop loss moves to entry price.
-- After +10%, trailing SL moves up by half of the extra move above the +10% trigger.
+- After +10%, trailing SL moves up by 2/3 of the extra move above the +10% trigger.
 - Default MIS force-exit time is 15:25 IST.
 - Optional daily loss guard:
 
