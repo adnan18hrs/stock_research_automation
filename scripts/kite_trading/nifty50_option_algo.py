@@ -3,8 +3,10 @@
 NIFTY 50 option signal executor for Kite Connect v3.
 
 Signal rules:
-  buy  -> buy the nearest NIFTY CE strike above spot, rounded to 100.
-  sell -> buy the nearest NIFTY PE strike below spot, rounded to 100.
+  buy  -> anchor to the nearest NIFTY CE strike above spot, rounded to 100,
+          then buy the nearby strike whose option LTP is closest to 100.
+  sell -> anchor to the nearest NIFTY PE strike below spot, rounded to 100,
+          then buy the nearby strike whose option LTP is closest to 100.
 
 Risk management:
   - Initial stop loss is 5% below entry.
@@ -37,7 +39,7 @@ from dataclasses import asdict, dataclass
 from datetime import date, datetime, time as datetime_time
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 try:
     from zoneinfo import ZoneInfo
@@ -52,6 +54,9 @@ DEFAULT_INSTRUMENT_CACHE = ROOT_DIR / "logs" / "kite_nfo_instruments.csv"
 KITE_API_BASE = "https://api.kite.trade"
 NIFTY_SPOT_KEY = "NSE:NIFTY 50"
 FIXED_LOTS = 2
+OPTION_PRICE_TARGET = 100.0
+OPTION_STRIKE_SCAN_RANGE = 150
+OPTION_STRIKE_SCAN_STEP = 50
 LOG = logging.getLogger("nifty50_option_algo")
 
 
@@ -420,37 +425,110 @@ def parse_nifty_options(instruments_csv_text: str) -> List[OptionInstrument]:
     return options
 
 
-def choose_option(
+def candidate_strikes_around(anchor_strike: int) -> List[int]:
+    return [
+        int(anchor_strike + offset)
+        for offset in range(-OPTION_STRIKE_SCAN_RANGE, OPTION_STRIKE_SCAN_RANGE + 1, OPTION_STRIKE_SCAN_STEP)
+        if anchor_strike + offset > 0
+    ]
+
+
+def choose_option_by_target_price(
+    client: KiteClient,
     options: List[OptionInstrument],
     *,
     signal: str,
-    strike: int,
+    anchor_strike: int,
     as_of: date,
-) -> OptionInstrument:
+    paper_option_ltp: Optional[float],
+) -> Tuple[OptionInstrument, float]:
     instrument_type = "CE" if signal == "buy" else "PE"
-    matches = [
-        option
-        for option in options
-        if option.instrument_type == instrument_type
-        and option.strike == strike
-        and option.expiry >= as_of
-    ]
-    if not matches:
+    candidate_strikes = candidate_strikes_around(anchor_strike)
+    LOG.info(
+        "Scanning nearby %s strikes for option LTP closest to %.2f: anchor=%s candidates=%s",
+        instrument_type,
+        OPTION_PRICE_TARGET,
+        anchor_strike,
+        ",".join(str(strike) for strike in candidate_strikes),
+    )
+
+    candidates: List[OptionInstrument] = []
+    for strike in candidate_strikes:
+        matches = [
+            option
+            for option in options
+            if option.instrument_type == instrument_type
+            and option.strike == strike
+            and option.expiry >= as_of
+        ]
+        if not matches:
+            LOG.warning("No NIFTY %s instrument found for candidate strike %s", instrument_type, strike)
+            continue
+        candidates.append(sorted(matches, key=lambda item: (item.expiry, item.tradingsymbol))[0])
+
+    if not candidates:
         raise SystemExit(
-            f"No NIFTY {instrument_type} instrument found for strike {strike}. "
+            f"No NIFTY {instrument_type} instruments found near anchor strike {anchor_strike}. "
             "Refresh the NFO instruments cache and try again."
         )
-    selected = sorted(matches, key=lambda item: (item.expiry, item.tradingsymbol))[0]
+
+    if paper_option_ltp is not None:
+        LOG.info(
+            "Using paper option LTP for target-price scan; all candidate LTPs are treated as %.2f",
+            paper_option_ltp,
+        )
+        scored = [(paper_option_ltp, abs(paper_option_ltp - OPTION_PRICE_TARGET), option) for option in candidates]
+    else:
+        quote_keys = [f"{option.exchange}:{option.tradingsymbol}" for option in candidates]
+        prices = client.quote_ltp(quote_keys)
+        scored = []
+        for option in candidates:
+            key = f"{option.exchange}:{option.tradingsymbol}"
+            ltp = prices.get(key)
+            if ltp is None:
+                LOG.warning("Option LTP missing for candidate %s strike=%s", key, option.strike)
+                continue
+            distance = abs(ltp - OPTION_PRICE_TARGET)
+            scored.append((ltp, distance, option))
+
+    if not scored:
+        raise KiteApiError("Could not fetch LTP for any nearby option candidate.")
+
+    for ltp, distance, option in sorted(scored, key=lambda item: item[2].strike):
+        LOG.info(
+            "Candidate option: %s:%s type=%s strike=%s expiry=%s ltp=%.2f target_gap=%.2f",
+            option.exchange,
+            option.tradingsymbol,
+            option.instrument_type,
+            option.strike,
+            option.expiry,
+            ltp,
+            distance,
+        )
+
+    selected_ltp, selected_distance, selected = sorted(
+        scored,
+        key=lambda item: (
+            item[1],
+            abs(item[2].strike - anchor_strike),
+            item[2].expiry,
+            item[2].tradingsymbol,
+        ),
+    )[0]
     LOG.info(
-        "Selected option: %s:%s type=%s strike=%s expiry=%s lot_size=%s",
+        "Selected option closest to %.2f LTP: %s:%s type=%s anchor_strike=%s selected_strike=%s expiry=%s lot_size=%s ltp=%.2f target_gap=%.2f",
+        OPTION_PRICE_TARGET,
         selected.exchange,
         selected.tradingsymbol,
         selected.instrument_type,
+        anchor_strike,
         selected.strike,
         selected.expiry,
         selected.lot_size,
+        selected_ltp,
+        selected_distance,
     )
-    return selected
+    return selected, selected_ltp
 
 
 def get_nifty_ltp(client: KiteClient, paper_nifty_ltp: Optional[float]) -> float:
@@ -602,14 +680,14 @@ def start_position(args: argparse.Namespace) -> ManagedPosition:
     LOG.info("Starting new signal: signal=%s mode=%s lots=%s product=%s", args.signal, "LIVE" if execute else "DRY_RUN", args.lots, args.product)
 
     nifty_ltp = get_nifty_ltp(client, args.paper_nifty_ltp)
-    strike = selected_strike(args.signal, nifty_ltp)
+    anchor_strike = selected_strike(args.signal, nifty_ltp)
     instrument_type = "CE" if args.signal == "buy" else "PE"
     LOG.info(
-        "Strike rule resolved: signal=%s nifty_ltp=%.2f option_type=%s strike=%s",
+        "Anchor strike rule resolved: signal=%s nifty_ltp=%.2f option_type=%s anchor_strike=%s",
         args.signal,
         nifty_ltp,
         instrument_type,
-        strike,
+        anchor_strike,
     )
 
     nfo_csv = load_or_refresh_nfo_instruments(
@@ -617,11 +695,13 @@ def start_position(args: argparse.Namespace) -> ManagedPosition:
         cache_file=args.instrument_cache,
         refresh=args.refresh_instruments,
     )
-    instrument = choose_option(
+    instrument, option_ltp = choose_option_by_target_price(
+        client,
         parse_nifty_options(nfo_csv),
         signal=args.signal,
-        strike=strike,
+        anchor_strike=anchor_strike,
         as_of=ist_now().date(),
+        paper_option_ltp=args.paper_option_ltp,
     )
 
     initial_qty = args.lots * instrument.lot_size
@@ -629,15 +709,15 @@ def start_position(args: argparse.Namespace) -> ManagedPosition:
     if half_exit_qty <= 0 or half_exit_qty >= initial_qty:
         raise SystemExit("Could not calculate a valid half-exit quantity.")
 
-    option_ltp = get_option_ltp(client, instrument, args.paper_option_ltp)
     LOG.info(
-        "Entry plan: signal=%s NIFTY=%.2f option=%s:%s type=%s strike=%s expiry=%s lot_size=%s lots=%s qty=%s half_exit_qty=%s current_option_ltp=%.2f",
+        "Entry plan: signal=%s NIFTY=%.2f option=%s:%s type=%s anchor_strike=%s selected_strike=%s expiry=%s lot_size=%s lots=%s qty=%s half_exit_qty=%s current_option_ltp=%.2f",
         args.signal,
         nifty_ltp,
         instrument.exchange,
         instrument.tradingsymbol,
         instrument_type,
-        strike,
+        anchor_strike,
+        instrument.strike,
         instrument.expiry,
         instrument.lot_size,
         args.lots,

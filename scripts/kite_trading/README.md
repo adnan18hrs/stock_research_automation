@@ -26,6 +26,9 @@ Logs and state are still stored in:
 Risk rules in `nifty50_option_algo.py`:
 
 - Always buys exactly 2 lots for `1` / `2` signals.
+- First anchors to the nearest valid 100-point NIFTY strike: `1` uses CE above spot, `2` uses PE below spot.
+- Before entry, scans nearby strikes from `anchor - 150` to `anchor + 150` in 50-point steps.
+- From those candidates, buys the same CE/PE expiry whose LTP is closest to 100.
 - Initial stop loss is 5% below entry; if hit before target, both lots exit.
 - At +10% option profit, 1 lot exits.
 - Remaining 1 lot stop loss moves to entry price.
