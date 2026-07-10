@@ -1,6 +1,7 @@
 import argparse
 import csv
 import json
+import re
 import sys
 import time
 from datetime import datetime, timedelta
@@ -116,6 +117,10 @@ def normalize_symbol(symbol):
     return (symbol or "").strip().upper()
 
 
+def normalize_xlsx_symbol(symbol):
+    return re.sub(r"[^A-Za-z]", "", str(symbol or "").strip()).upper()
+
+
 def parse_symbol_items(items):
     symbols = []
 
@@ -150,15 +155,77 @@ def load_symbols_from_csv(csv_file):
     return symbols
 
 
+def load_symbols_from_xlsx(xlsx_file):
+    try:
+        from openpyxl import load_workbook
+    except ImportError as exc:
+        raise ImportError("openpyxl is required to read .xlsx ticker files.") from exc
+
+    xlsx_path = Path(xlsx_file)
+
+    if not xlsx_path.exists():
+        raise FileNotFoundError(f"XLSX file not found: {xlsx_path}")
+
+    workbook = load_workbook(xlsx_path, read_only=True, data_only=True)
+    sheet = workbook.active
+    header_row = next(sheet.iter_rows(min_row=1, max_row=1, values_only=True), None)
+
+    if not header_row:
+        raise ValueError("XLSX file must contain a header row.")
+
+    ticker_column = None
+    for index, header in enumerate(header_row):
+        if str(header or "").strip().lower() == "ticker":
+            ticker_column = index
+            break
+
+    if ticker_column is None:
+        raise ValueError("XLSX file must contain Ticker column.")
+
+    symbols = []
+
+    for row in sheet.iter_rows(min_row=2, values_only=True):
+        value = row[ticker_column] if ticker_column < len(row) else None
+        symbol = normalize_xlsx_symbol(value)
+        if symbol and symbol not in symbols:
+            symbols.append(symbol)
+
+    workbook.close()
+    return symbols
+
+
+def load_symbols_from_file(symbol_file):
+    symbol_path = Path(symbol_file)
+    if symbol_path.suffix.lower() == ".xlsx":
+        return load_symbols_from_xlsx(symbol_path)
+
+    return load_symbols_from_csv(symbol_path)
+
+
+def load_company_names_from_file(symbol_file):
+    symbol_path = Path(symbol_file)
+    if symbol_path.suffix.lower() == ".xlsx":
+        return {}
+
+    return load_company_names(symbol_path)
+
+
 def resolve_symbols(args):
     if args.mode == "1":
-        return load_symbols_from_csv(args.csv_file)
+        symbols = load_symbols_from_file(args.csv_file)
+    else:
+        symbols = parse_symbol_items(args.manual_symbols)
+        if not symbols:
+            symbols = parse_symbol_items(MANUAL_SYMBOLS)
 
-    symbols = parse_symbol_items(args.manual_symbols)
-    if symbols:
-        return symbols
+    if args.start_after:
+        start_after = normalize_symbol(args.start_after)
+        if start_after in symbols:
+            symbols = symbols[symbols.index(start_after) + 1 :]
+        else:
+            print(f"Warning: --start-after symbol not found: {start_after}")
 
-    return parse_symbol_items(MANUAL_SYMBOLS)
+    return symbols
 
 
 def is_stale(path, max_age_days):
@@ -435,65 +502,88 @@ def process_symbol(symbol, args, context):
     print(f"Processing {symbol}")
     print("=" * 70)
 
-    try:
-        annual_updated = update_annual_reports(
-            context["nse_session"],
-            ticker_dir,
-            symbol,
-            args.max_annual_reports,
-            args.request_timeout,
-        )
-        data_updated = data_updated or annual_updated
-    except Exception as exc:
-        print(f"{symbol}: annual report update failed: {exc}")
-
-    screener_path = ticker_dir / "screener_finance" / "company_page.html"
-    if args.force_data or is_stale(screener_path, args.screener_max_age_days):
+    if args.skip_data_refresh:
+        print(f"{symbol}: data refresh skipped by --skip-data-refresh")
+    else:
         try:
-            screener_updated = download_screener_page(
-                context["http_session"],
+            annual_updated = update_annual_reports(
+                context["nse_session"],
                 ticker_dir,
                 symbol,
+                args.max_annual_reports,
                 args.request_timeout,
             )
-            data_updated = data_updated or screener_updated
+            data_updated = data_updated or annual_updated
         except Exception as exc:
-            print(f"{symbol}: screener page update failed: {exc}")
+            print(f"{symbol}: annual report update failed: {exc}")
 
-    try:
-        transcript_updated = update_transcripts(
-            context["http_session"],
-            ticker_dir,
-            symbol,
-            args.max_transcripts,
+        screener_path = ticker_dir / "screener_finance" / "company_page.html"
+        if args.force_data or is_stale(screener_path, args.screener_max_age_days):
+            try:
+                screener_updated = download_screener_page(
+                    context["http_session"],
+                    ticker_dir,
+                    symbol,
+                    args.request_timeout,
+                )
+                data_updated = data_updated or screener_updated
+            except Exception as exc:
+                print(f"{symbol}: screener page update failed: {exc}")
+
+        if args.skip_transcripts:
+            print(f"{symbol}: transcript update skipped by --skip-transcripts")
+        else:
+            try:
+                transcript_updated = update_transcripts(
+                    context["http_session"],
+                    ticker_dir,
+                    symbol,
+                    args.max_transcripts,
+                )
+                data_updated = data_updated or transcript_updated
+            except Exception as exc:
+                print(f"{symbol}: transcript update failed: {exc}")
+
+        pre_news_status = has_minimum_data(ticker_dir)
+        core_data_missing = any(
+            not pre_news_status[name]
+            for name in ("annual_reports", "screener_page", "transcripts_metadata")
         )
-        data_updated = data_updated or transcript_updated
-    except Exception as exc:
-        print(f"{symbol}: transcript update failed: {exc}")
 
-    news_path = ticker_dir / "news" / "news_links.txt"
-    if args.skip_news:
-        print(f"{symbol}: news update skipped by --skip-news")
-    elif args.force_data or is_stale(news_path, args.news_max_age_days):
-        try:
-            company_name = context["company_names"].get(symbol, "")
-            news_updated = update_news_links(
-                ticker_dir,
-                symbol,
-                company_name,
-                args.max_news_links,
-                args.news_timeout,
-                not args.disable_news_fallback,
-            )
-            data_updated = data_updated or news_updated
-        except Exception as exc:
-            print(f"{symbol}: news update failed: {exc}")
+        news_path = ticker_dir / "news" / "news_links.txt"
+        if args.skip_news:
+            print(f"{symbol}: news update skipped by --skip-news")
+        elif args.skip_analysis_if_missing_data and core_data_missing:
+            print(f"{symbol}: news update skipped because core data sections are missing")
+        elif args.force_data or is_stale(news_path, args.news_max_age_days):
+            try:
+                company_name = context["company_names"].get(symbol, "")
+                news_updated = update_news_links(
+                    ticker_dir,
+                    symbol,
+                    company_name,
+                    args.max_news_links,
+                    args.news_timeout,
+                    not args.disable_news_fallback,
+                )
+                data_updated = data_updated or news_updated
+            except Exception as exc:
+                print(f"{symbol}: news update failed: {exc}")
 
     status = has_minimum_data(ticker_dir)
     missing = [name for name, present in status.items() if not present]
 
     if missing:
         print(f"{symbol}: warning, missing data sections: {', '.join(missing)}")
+        if args.skip_analysis_if_missing_data:
+            report_path = ticker_dir / "investment_analysis.md"
+            if report_path.exists() and not data_updated and not args.force_analysis:
+                print(f"{symbol}: best condition, data current and investment_analysis.md exists")
+                print_score_log(ticker_dir)
+                return {"symbol": symbol, "data_updated": data_updated, "analysis": "already_current"}
+
+            print(f"{symbol}: analysis skipped because required data sections are missing")
+            return {"symbol": symbol, "data_updated": data_updated, "analysis": "skipped"}
 
     if args.skip_analysis:
         print(f"{symbol}: analysis skipped by --skip-analysis")
@@ -523,15 +613,23 @@ def main():
     )
     parser.add_argument("--csv-file", default=str(DEFAULT_CSV_FILE))
     parser.add_argument("--manual-symbols", nargs="*", help="Mode 2 override, comma-separated or space-separated.")
+    parser.add_argument("--start-after", help="Resume after this normalized symbol in the selected symbol list.")
     parser.add_argument("--data-dir", default=str(DATA_DIR))
     parser.add_argument("--max-annual-reports", type=int, default=MAX_ANNUAL_REPORTS)
     parser.add_argument("--max-transcripts", type=int, default=MAX_TRANSCRIPTS)
     parser.add_argument("--max-news-links", type=int, default=MAX_NEWS_LINKS)
+    parser.add_argument("--skip-transcripts", action="store_true", help="Do not refresh/download concall transcripts.")
     parser.add_argument("--screener-max-age-days", type=int, default=7)
     parser.add_argument("--news-max-age-days", type=int, default=1)
     parser.add_argument("--force-data", action="store_true")
+    parser.add_argument("--skip-data-refresh", action="store_true", help="Use only existing local data and reports.")
     parser.add_argument("--force-analysis", action="store_true")
     parser.add_argument("--skip-analysis", action="store_true")
+    parser.add_argument(
+        "--skip-analysis-if-missing-data",
+        action="store_true",
+        help="Do not generate AI analysis when required data sections are missing.",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Refresh/audit data and build evidence, but do not call Codex.")
     parser.add_argument("--save-evidence", action="store_true")
     parser.add_argument("--model", default="")
@@ -563,7 +661,7 @@ def main():
     context = {
         "nse_session": make_nse_session(args.request_timeout),
         "http_session": requests.Session(),
-        "company_names": load_company_names(Path(args.csv_file)),
+        "company_names": load_company_names_from_file(args.csv_file),
         "prompt": prompt_path.read_text(encoding="utf-8") if prompt_path.exists() else "",
     }
 

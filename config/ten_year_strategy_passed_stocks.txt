@@ -1,0 +1,5 @@
+# Passed stocks for 10 year sales + return strategy
+# Generated: 2026-07-09 01:38:39
+# Count: 1
+
+CAPLIPOINT

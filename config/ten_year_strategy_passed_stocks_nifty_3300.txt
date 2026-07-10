@@ -1,0 +1,7 @@
+# Passed stocks for 10 year sales + return strategy
+# Generated: 2026-07-10 17:30:42
+# Count: 3
+
+BAJAJFINSV
+CAPLIPOINT
+KOVAI
