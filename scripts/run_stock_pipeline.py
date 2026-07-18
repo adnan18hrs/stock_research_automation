@@ -5,10 +5,15 @@ import re
 import sys
 import time
 from datetime import datetime, timedelta
+from html import unescape
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, urljoin
 
 import requests
+try:
+    from bs4 import BeautifulSoup
+except ImportError:
+    BeautifulSoup = None
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 ROOT_DIR = SCRIPT_DIR.parent
@@ -22,6 +27,7 @@ from AI_analysis_codex_on_ticker import (  # noqa: E402
 )
 from download_news_links_working import (  # noqa: E402
     build_query,
+    clean_company_name,
     get_news_items,
     load_company_names,
     write_outputs as write_news_outputs,
@@ -112,6 +118,8 @@ SCREENER_HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
+SCREENER_BASE_URL = "https://www.screener.in"
+
 
 def normalize_symbol(symbol):
     return (symbol or "").strip().upper()
@@ -144,11 +152,14 @@ def load_symbols_from_csv(csv_file):
     with csv_path.open("r", encoding="utf-8-sig", newline="") as handle:
         reader = csv.DictReader(handle)
 
-        if "SYMBOL" not in (reader.fieldnames or []):
-            raise ValueError("CSV must contain SYMBOL column.")
+        fieldnames = reader.fieldnames or []
+        symbol_field = next((name for name in fieldnames if name.strip().lower() == "symbol"), None)
+
+        if not symbol_field:
+            raise ValueError("CSV must contain SYMBOL or Symbol column.")
 
         for row in reader:
-            symbol = normalize_symbol(row.get("SYMBOL"))
+            symbol = normalize_symbol(row.get(symbol_field))
             if symbol and symbol not in symbols:
                 symbols.append(symbol)
 
@@ -207,7 +218,33 @@ def load_company_names_from_file(symbol_file):
     if symbol_path.suffix.lower() == ".xlsx":
         return {}
 
-    return load_company_names(symbol_path)
+    names = load_company_names(symbol_path)
+    if names:
+        return names
+
+    with symbol_path.open("r", encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle)
+        fieldnames = reader.fieldnames or []
+        symbol_field = next((name for name in fieldnames if name.strip().lower() == "symbol"), None)
+        company_field = next(
+            (
+                name
+                for name in fieldnames
+                if name.strip().lower() in {"company name", "security name", "name"}
+            ),
+            None,
+        )
+
+        if not symbol_field or not company_field:
+            return {}
+
+        for row in reader:
+            symbol = normalize_symbol(row.get(symbol_field))
+            company = (row.get(company_field) or "").strip()
+            if symbol and company:
+                names[symbol] = clean_company_name(company)
+
+    return names
 
 
 def resolve_symbols(args):
@@ -245,6 +282,10 @@ def ensure_ticker_dir(data_dir, symbol):
     return ticker_dir
 
 
+def report_exists(data_dir, symbol):
+    return (data_dir / symbol / "investment_analysis.md").exists()
+
+
 def make_nse_session(timeout):
     session = requests.Session()
     try:
@@ -268,32 +309,264 @@ def annual_report_filename(row):
     return f"{row['fromYr']}_{row['toYr']}.pdf"
 
 
-def update_annual_reports(session, ticker_dir, symbol, max_reports, timeout):
+def validate_pdf_content(content):
+    if len(content) < 1000:
+        raise RuntimeError("Downloaded annual report is unexpectedly small.")
+
+    if not content.lstrip()[:5] == b"%PDF-":
+        raise RuntimeError("Downloaded annual report is not a PDF.")
+
+
+def has_valid_pdf_file(path):
+    if not path.exists() or path.stat().st_size < 1000:
+        return False
+
+    try:
+        with path.open("rb") as handle:
+            header = handle.read(2048)
+    except OSError:
+        return False
+
+    return header.lstrip()[:5] == b"%PDF-"
+
+
+def extract_financial_year(text):
+    text = text or ""
+    short_range = re.search(r"((?:19|20)\d{2})\s*[-/]\s*(\d{2})(?!\d)", text)
+
+    if short_range:
+        start_year = int(short_range.group(1))
+        end_year = (start_year // 100) * 100 + int(short_range.group(2))
+        if end_year < start_year:
+            end_year += 100
+        return end_year
+
+    years = [int(year) for year in re.findall(r"(?:19|20)\d{2}", text)]
+
+    if not years:
+        return None
+
+    return max(years)
+
+
+def screener_annual_report_filename(link_text, index):
+    financial_year = extract_financial_year(link_text)
+
+    if financial_year:
+        return f"{financial_year - 1}_{financial_year}.pdf"
+
+    return f"screener_annual_report_{index:02d}.pdf"
+
+
+def extract_screener_annual_reports(html, max_reports):
+    if BeautifulSoup is None:
+        return extract_screener_annual_reports_regex(html, max_reports)
+
+    soup = BeautifulSoup(html, "html.parser")
+    section = soup.select_one(".documents.annual-reports")
+
+    if not section:
+        for heading in soup.find_all(["h2", "h3", "h4"]):
+            if heading.get_text(" ", strip=True).lower() == "annual reports":
+                section = heading.find_parent()
+                break
+
+    if not section:
+        return []
+
+    reports = []
+    seen_urls = set()
+    seen_files = set()
+
+    for link in section.select("a[href]"):
+        href = (link.get("href") or "").strip()
+        link_text = link.get_text(" ", strip=True)
+
+        if not href or href in seen_urls:
+            continue
+
+        if ".pdf" not in href.lower() and "annpdfopen.aspx" not in href.lower():
+            continue
+
+        filename = screener_annual_report_filename(link_text, len(reports) + 1)
+        if filename in seen_files:
+            continue
+
+        seen_urls.add(href)
+        seen_files.add(filename)
+        reports.append(
+            {
+                "year": extract_financial_year(link_text),
+                "url": urljoin(SCREENER_BASE_URL, href),
+                "filename": filename,
+            }
+        )
+
+        if len(reports) >= max_reports:
+            break
+
+    return reports
+
+
+def strip_html_tags(text):
+    return re.sub(r"<[^>]+>", " ", text or "").strip()
+
+
+def extract_html_attr(tag, name):
+    match = re.search(rf"""{name}\s*=\s*["']([^"']*)["']""", tag or "", flags=re.I)
+    return unescape(match.group(1)) if match else ""
+
+
+def extract_screener_annual_reports_regex(html, max_reports):
+    reports = []
+    seen_urls = set()
+    seen_files = set()
+
+    section_start = (html or "").lower().find("annual reports")
+    section_html = html[section_start:] if section_start != -1 else (html or "")
+
+    for match in re.finditer(r"<a\b[^>]*>", section_html, flags=re.I):
+        tag = match.group(0)
+        href = extract_html_attr(tag, "href").strip()
+        if not href or href in seen_urls:
+            continue
+
+        if ".pdf" not in href.lower() and "annpdfopen.aspx" not in href.lower():
+            continue
+
+        close = re.search(r"</a\s*>", section_html[match.end() :], flags=re.I)
+        link_text = ""
+        if close:
+            link_text = strip_html_tags(unescape(section_html[match.end() : match.end() + close.start()]))
+
+        filename = screener_annual_report_filename(link_text, len(reports) + 1)
+        if filename in seen_files:
+            continue
+
+        seen_urls.add(href)
+        seen_files.add(filename)
+        reports.append(
+            {
+                "year": extract_financial_year(link_text),
+                "url": urljoin(SCREENER_BASE_URL, href),
+                "filename": filename,
+            }
+        )
+
+        if len(reports) >= max_reports:
+            break
+
+    return reports
+
+
+def update_annual_reports_from_screener(session, ticker_dir, symbol, max_reports, timeout):
     target_dir = ticker_dir / "annual_reports"
     target_dir.mkdir(parents=True, exist_ok=True)
 
-    rows = fetch_annual_report_rows(session, symbol, timeout)[:max_reports]
+    try:
+        page_updated = download_screener_page(session, ticker_dir, symbol, timeout)
+    except Exception as exc:
+        print(f"{symbol}: screener annual report fallback failed, page download failed: {exc}")
+        return False
+
+    html = load_screener_html(ticker_dir)
+
+    if not html:
+        print(f"{symbol}: screener annual report fallback failed, page missing")
+        return False
+
+    reports = extract_screener_annual_reports(html, max_reports)
+
+    if not reports:
+        print(f"{symbol}: no annual reports found from Screener")
+        return False
+
+    updated = page_updated
+    downloaded = 0
+    failed = 0
+
+    for report in reports:
+        target_file = target_dir / report["filename"]
+
+        if has_valid_pdf_file(target_file):
+            continue
+
+        try:
+            download_transcript_pdf(session, report["url"], target_file)
+            validate_pdf_content(target_file.read_bytes())
+            updated = True
+            downloaded += 1
+            print(f"{symbol}: downloaded Screener annual report {report['filename']}")
+        except Exception as exc:
+            if target_file.exists() and not has_valid_pdf_file(target_file):
+                target_file.unlink()
+            failed += 1
+            print(f"{symbol}: Screener annual report failed {report['filename']}: {exc}")
+
+    print(f"{symbol}: screener annual reports found={len(reports)} downloaded={downloaded} failed={failed}")
+    return updated
+
+
+def update_annual_reports(
+    nse_session,
+    screener_session,
+    ticker_dir,
+    symbol,
+    max_reports,
+    timeout,
+    use_screener_fallback,
+):
+    target_dir = ticker_dir / "annual_reports"
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    fallback_needed = False
+    updated = False
+
+    try:
+        rows = fetch_annual_report_rows(nse_session, symbol, timeout)[:max_reports]
+    except Exception as exc:
+        rows = []
+        fallback_needed = True
+        print(f"{symbol}: annual report lookup failed from NSE, trying Screener: {exc}")
 
     if not rows:
         print(f"{symbol}: no annual reports found from NSE")
-        return False
-
-    updated = False
+        fallback_needed = True
+    elif len(rows) < max_reports:
+        print(f"{symbol}: only {len(rows)} annual report(s) found from NSE, trying Screener for missing years")
+        fallback_needed = True
 
     for row in rows:
-        filename = annual_report_filename(row)
-        target_file = target_dir / filename
+        try:
+            filename = annual_report_filename(row)
+            target_file = target_dir / filename
 
-        if target_file.exists() and target_file.stat().st_size > 1000:
-            continue
+            if has_valid_pdf_file(target_file):
+                continue
 
-        pdf_url = row["fileName"]
-        response = session.get(pdf_url, headers=NSE_HEADERS, timeout=timeout)
-        response.raise_for_status()
+            pdf_url = row["fileName"]
+            response = nse_session.get(pdf_url, headers=NSE_HEADERS, timeout=timeout)
+            response.raise_for_status()
+            validate_pdf_content(response.content)
 
-        target_file.write_bytes(response.content)
-        updated = True
-        print(f"{symbol}: downloaded annual report {filename}")
+            target_file.write_bytes(response.content)
+            updated = True
+            print(f"{symbol}: downloaded annual report {filename}")
+        except Exception as exc:
+            fallback_needed = True
+            report_label = row.get("fileName") or row.get("toYr") or "unknown"
+            print(f"{symbol}: NSE annual report failed {report_label}, trying Screener fallback: {exc}")
+
+    if fallback_needed and use_screener_fallback:
+        updated = update_annual_reports_from_screener(
+            screener_session,
+            ticker_dir,
+            symbol,
+            max_reports,
+            timeout,
+        ) or updated
+    elif fallback_needed:
+        print(f"{symbol}: Screener annual report fallback disabled")
 
     return updated
 
@@ -508,10 +781,12 @@ def process_symbol(symbol, args, context):
         try:
             annual_updated = update_annual_reports(
                 context["nse_session"],
+                context["http_session"],
                 ticker_dir,
                 symbol,
                 args.max_annual_reports,
                 args.request_timeout,
+                not args.disable_screener_annual_report_fallback,
             )
             data_updated = data_updated or annual_updated
         except Exception as exc:
@@ -618,12 +893,25 @@ def main():
     parser.add_argument("--max-annual-reports", type=int, default=MAX_ANNUAL_REPORTS)
     parser.add_argument("--max-transcripts", type=int, default=MAX_TRANSCRIPTS)
     parser.add_argument("--max-news-links", type=int, default=MAX_NEWS_LINKS)
+    parser.add_argument(
+        "--disable-screener-annual-report-fallback",
+        action="store_true",
+        help="Do not use Screener annual-report links when NSE has no usable annual report.",
+    )
     parser.add_argument("--skip-transcripts", action="store_true", help="Do not refresh/download concall transcripts.")
     parser.add_argument("--screener-max-age-days", type=int, default=7)
     parser.add_argument("--news-max-age-days", type=int, default=1)
     parser.add_argument("--force-data", action="store_true")
     parser.add_argument("--skip-data-refresh", action="store_true", help="Use only existing local data and reports.")
     parser.add_argument("--force-analysis", action="store_true")
+    parser.add_argument(
+        "--fresh",
+        action="store_true",
+        help=(
+            "Process every selected symbol even when data/<symbol>/investment_analysis.md exists. "
+            "Without this flag, only symbols missing investment_analysis.md are processed."
+        ),
+    )
     parser.add_argument("--skip-analysis", action="store_true")
     parser.add_argument(
         "--skip-analysis-if-missing-data",
@@ -650,23 +938,59 @@ def main():
         raise ValueError("Mode must be 1 or 2.")
 
     symbols = resolve_symbols(args)
+    requested_symbol_count = len(symbols)
+    data_dir = Path(args.data_dir)
+    skipped_existing_reports = 0
+
+    if args.fresh:
+        print("Fresh mode enabled: processing every selected symbol.")
+    else:
+        missing_report_symbols = [
+            symbol for symbol in symbols if not report_exists(data_dir, symbol)
+        ]
+        skipped_existing_reports = len(symbols) - len(missing_report_symbols)
+        symbols = missing_report_symbols
+        print(
+            "Missing-report mode enabled: "
+            f"processing {len(symbols)} symbol(s) without investment_analysis.md; "
+            f"skipping {skipped_existing_reports} existing report(s)."
+        )
 
     if not symbols:
-        raise ValueError("No symbols found. Add MANUAL_SYMBOLS or pass --manual-symbols.")
+        print("No symbols need processing.")
+        print("\nDONE")
+        print(
+            json.dumps(
+                {
+                    "symbols_requested": requested_symbol_count,
+                    "symbols": 0,
+                    "symbols_with_existing_reports_skipped": skipped_existing_reports,
+                    "data_updated": 0,
+                    "analysis_generated": 0,
+                    "analysis_current": 0,
+                    "analysis_skipped": 0,
+                    "analysis_failed": 0,
+                },
+                indent=2,
+            )
+        )
+        return 0
 
     prompt_path = PROMPT_FILE
     if not prompt_path.exists() and not args.skip_analysis:
         raise FileNotFoundError(f"Prompt file not found: {prompt_path}")
 
     context = {
-        "nse_session": make_nse_session(args.request_timeout),
+        "nse_session": requests.Session() if args.skip_data_refresh else make_nse_session(args.request_timeout),
         "http_session": requests.Session(),
         "company_names": load_company_names_from_file(args.csv_file),
         "prompt": prompt_path.read_text(encoding="utf-8") if prompt_path.exists() else "",
     }
 
     counts = {
+        "symbols_requested": requested_symbol_count,
         "symbols": len(symbols),
+        "symbols_with_existing_reports_skipped": skipped_existing_reports,
         "data_updated": 0,
         "analysis_generated": 0,
         "analysis_current": 0,

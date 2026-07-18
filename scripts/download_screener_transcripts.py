@@ -4,11 +4,15 @@ import re
 import shutil
 import subprocess
 import time
+from html import unescape
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
 import requests
-from bs4 import BeautifulSoup
+try:
+    from bs4 import BeautifulSoup
+except ImportError:
+    BeautifulSoup = None
 
 
 BASE_DIR = Path("data")
@@ -117,6 +121,9 @@ def filename_from_url(url, index, period):
 
 
 def extract_transcripts(html, max_transcripts):
+    if BeautifulSoup is None:
+        return extract_transcripts_regex(html, max_transcripts)
+
     soup = BeautifulSoup(html, "html.parser")
     transcripts = []
     seen = set()
@@ -154,6 +161,58 @@ def extract_transcripts(html, max_transcripts):
             }
         )
 
+        if len(transcripts) >= max_transcripts:
+            break
+
+    return transcripts
+
+
+def strip_tags(text):
+    return re.sub(r"<[^>]+>", " ", text or "").strip()
+
+
+def extract_attr(tag, name):
+    match = re.search(rf"""{name}\s*=\s*["']([^"']*)["']""", tag or "", flags=re.I)
+    return unescape(match.group(1)) if match else ""
+
+
+def extract_transcripts_regex(html, max_transcripts):
+    transcripts = []
+    seen = set()
+
+    for match in re.finditer(r"<a\b[^>]*>", html or "", flags=re.I):
+        tag = match.group(0)
+        if "concall-link" not in tag:
+            continue
+
+        close = re.search(r"</a\s*>", html[match.end() :], flags=re.I)
+        text = ""
+        if close:
+            text = strip_tags(html[match.end() : match.end() + close.start()])
+
+        title = extract_attr(tag, "title").strip().lower()
+        href = extract_attr(tag, "href")
+
+        is_transcript = title == "raw transcript" or text.strip().lower() == "transcript"
+        is_pdf = ".pdf" in href.lower() or "annpdfopen.aspx" in href.lower()
+        if not href or not is_transcript or not is_pdf or href in seen:
+            continue
+
+        seen.add(href)
+        period = ""
+        li_start = (html or "").rfind("<li", 0, match.start())
+        li_end = (html or "").find("</li>", match.end())
+        if li_start != -1 and li_end != -1:
+            li_html = html[li_start:li_end]
+            period_match = re.search(
+                r"""class\s*=\s*["'][^"']*ink-600[^"']*["'][^>]*>(.*?)</""",
+                li_html,
+                flags=re.I | re.S,
+            )
+            if period_match:
+                period = strip_tags(unescape(period_match.group(1)))
+
+        transcripts.append({"period": period, "url": href})
         if len(transcripts) >= max_transcripts:
             break
 

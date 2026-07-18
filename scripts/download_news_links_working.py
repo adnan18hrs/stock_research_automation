@@ -8,7 +8,10 @@ from pathlib import Path
 from urllib.parse import quote_plus
 
 import requests
-from ddgs import DDGS
+try:
+    from ddgs import DDGS
+except ImportError:
+    DDGS = None
 
 
 BASE_DIR = Path("data")
@@ -121,6 +124,10 @@ def google_news_search(query, max_links, timeout=60):
 
 
 def ddgs_news_fallback(query, max_links):
+    if DDGS is None:
+        print("Fallback search skipped: ddgs package is not installed.")
+        return []
+
     items = []
     seen = set()
 

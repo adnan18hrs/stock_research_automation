@@ -11,7 +11,11 @@ import urllib.request
 from datetime import date
 from pathlib import Path
 
-from bs4 import BeautifulSoup
+try:
+    from bs4 import BeautifulSoup
+except ImportError:
+    BeautifulSoup = None
+from html.parser import HTMLParser
 
 try:
     import fitz
@@ -104,12 +108,43 @@ def read_pdf(path, max_chars):
 
 def read_html(path):
     raw = path.read_text(encoding="utf-8", errors="ignore")
+    if BeautifulSoup is None:
+        parser = TextHTMLParser()
+        parser.feed(raw)
+        return clean_text(parser.get_text())
+
     soup = BeautifulSoup(raw, "html.parser")
 
     for tag in soup(["script", "style", "noscript", "svg"]):
         tag.decompose()
 
     return clean_text(soup.get_text("\n"))
+
+
+class TextHTMLParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.skip_depth = 0
+        self.parts = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag in {"script", "style", "noscript", "svg"}:
+            self.skip_depth += 1
+        elif tag in {"br", "p", "div", "li", "tr", "h1", "h2", "h3", "h4", "h5", "h6"}:
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag):
+        if tag in {"script", "style", "noscript", "svg"} and self.skip_depth:
+            self.skip_depth -= 1
+        elif tag in {"p", "div", "li", "tr"}:
+            self.parts.append("\n")
+
+    def handle_data(self, data):
+        if not self.skip_depth:
+            self.parts.append(data)
+
+    def get_text(self):
+        return "\n".join(self.parts)
 
 
 def read_json(path):

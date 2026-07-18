@@ -12,7 +12,8 @@ METRICS = {
     "governance": "Governance",
 }
 
-GOVERNANCE_MAX = 5.5
+MANAGEMENT_MIN = 7.5
+GROWTH_MIN = 7
 
 
 def normalize_metric(label):
@@ -125,7 +126,7 @@ def parse_scores(path):
 
 
 def passes_filter(scores):
-    return scores["governance"] < GOVERNANCE_MAX
+    return scores["management"] > MANAGEMENT_MIN and scores["growth"] > GROWTH_MIN
 
 
 def format_score(value):
@@ -137,8 +138,8 @@ def format_score(value):
 def main():
     parser = argparse.ArgumentParser(
         description=(
-            "Filter ticker investment_analysis.md reports where Governance "
-            f"is less than {GOVERNANCE_MAX}, "
+            "Filter ticker investment_analysis.md reports where Management "
+            f"is greater than {MANAGEMENT_MIN} and Growth Visibility is greater than {GROWTH_MIN}, "
             "sorted by summed total score."
         )
     )
@@ -167,7 +168,7 @@ def main():
     rows.sort(key=lambda row: (-row[0], row[1]))
 
     print(
-        f"Tickers with Governance < {GOVERNANCE_MAX}, "
+        f"Tickers with Management > {MANAGEMENT_MIN} and Growth Visibility > {GROWTH_MIN}, "
         "sorted by total score"
     )
     print()

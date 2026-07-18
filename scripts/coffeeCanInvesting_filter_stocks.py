@@ -7,7 +7,7 @@ import re
 import sys
 import time
 import warnings
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import quote
@@ -70,6 +70,7 @@ class SeriesCheck:
     years: list[str] = field(default_factory=list)
     values: list[float] = field(default_factory=list)
     growth_rates: list[float] = field(default_factory=list)
+    exempt_growth_years: list[str] = field(default_factory=list)
     min_value: float | None = None
     min_growth: float | None = None
 
@@ -181,8 +182,9 @@ def read_input_stock_files(csv_files):
     return stocks
 
 
-def screener_html_path(data_dir, symbol):
-    return Path(data_dir) / symbol / "screener_finance" / "company_page.html"
+def screener_html_path(data_dir, symbol, consolidated=True):
+    filename = "company_page.html" if consolidated else "company_page_standalone.html"
+    return Path(data_dir) / symbol / "screener_finance" / filename
 
 
 def should_refresh(path, max_age_days):
@@ -196,21 +198,22 @@ def should_refresh(path, max_age_days):
     return modified < datetime.now() - timedelta(days=max_age_days)
 
 
-def fetch_screener_page(session, symbol, data_dir, timeout):
-    url = f"https://www.screener.in/company/{quote(symbol, safe='')}/consolidated/"
+def fetch_screener_page(session, symbol, data_dir, timeout, consolidated=True):
+    suffix = "/consolidated/" if consolidated else "/"
+    url = f"https://www.screener.in/company/{quote(symbol, safe='')}{suffix}"
     response = session.get(url, headers=SCREENER_HEADERS, timeout=timeout)
     response.raise_for_status()
 
-    path = screener_html_path(data_dir, symbol)
+    path = screener_html_path(data_dir, symbol, consolidated=consolidated)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(response.text, encoding="utf-8")
     return response.text
 
 
-def load_or_fetch_screener_html(session, symbol, data_dir, fetch_missing, refresh_days, timeout):
-    path = screener_html_path(data_dir, symbol)
+def load_or_fetch_screener_html(session, symbol, data_dir, fetch_missing, refresh_days, timeout, consolidated=True):
+    path = screener_html_path(data_dir, symbol, consolidated=consolidated)
     if fetch_missing and should_refresh(path, refresh_days):
-        return fetch_screener_page(session, symbol, data_dir, timeout)
+        return fetch_screener_page(session, symbol, data_dir, timeout, consolidated=consolidated)
 
     if not path.exists():
         raise FileNotFoundError(f"Screener HTML not found: {path}")
@@ -282,7 +285,13 @@ def latest_complete_pairs(years, values, count):
     return pairs[-count:]
 
 
+def fiscal_year_end_year(year):
+    matches = re.findall(r"\d{4}", clean_text(year))
+    return int(matches[-1]) if matches else None
+
+
 def check_growth_series(years, values, periods, threshold):
+    covid_exception_year = 2021
     needed_values = periods + 1
     pairs = latest_complete_pairs(years, values, needed_values)
     if len(pairs) < needed_values:
@@ -304,10 +313,17 @@ def check_growth_series(years, values, periods, threshold):
         growth_rates.append(((current - previous) / previous) * 100)
 
     min_growth = min(growth_rates) if growth_rates else None
+    exempt_growth_years = [
+        selected_years[index + 1]
+        for index, growth in enumerate(growth_rates)
+        if growth < threshold
+        and fiscal_year_end_year(selected_years[index + 1]) == covid_exception_year
+    ]
     failed_years = [
         selected_years[index + 1]
         for index, growth in enumerate(growth_rates)
         if growth < threshold
+        and fiscal_year_end_year(selected_years[index + 1]) != covid_exception_year
     ]
 
     if failed_years:
@@ -316,6 +332,12 @@ def check_growth_series(years, values, periods, threshold):
             f"{', '.join(failed_years)}."
         )
         passed = False
+    elif exempt_growth_years:
+        reason = (
+            f"All non-COVID YoY sales growth rates are >= {threshold:g}%; "
+            f"FY2021 sales growth below {threshold:g}% allowed as COVID lockdown exception."
+        )
+        passed = True
     else:
         reason = f"All {periods} YoY sales growth rates are >= {threshold:g}%."
         passed = True
@@ -326,6 +348,7 @@ def check_growth_series(years, values, periods, threshold):
         years=selected_years,
         values=selected_values,
         growth_rates=growth_rates,
+        exempt_growth_years=exempt_growth_years,
         min_growth=min_growth,
     )
 
@@ -495,7 +518,59 @@ def detect_financial(stock, tables):
     return bool(find_row(ratios, ("ROE %", "ROE"))) and not find_row(ratios, ("ROCE %", "ROCE"))
 
 
-def evaluate_stock(stock, html, years, growth_threshold, metric_threshold, market_cap_threshold):
+def sales_growth_check(tables, years, growth_threshold):
+    profit_loss = tables.get("profit-loss", [])
+    sales_row = find_row(profit_loss, ("Sales +", "Sales", "Revenue +", "Revenue"))
+    return check_growth_series(
+        years=table_years(profit_loss),
+        values=row_values(sales_row),
+        periods=years,
+        threshold=growth_threshold,
+    )
+
+
+def choose_sales_check(consolidated_check, standalone_check=None, standalone_error=None):
+    if consolidated_check.passed:
+        return replace(
+            consolidated_check,
+            reason=f"Consolidated: {consolidated_check.reason}",
+        )
+
+    if standalone_check is None:
+        reason = f"Consolidated failed: {consolidated_check.reason}"
+        if standalone_error:
+            reason += f" Standalone fallback unavailable: {standalone_error}"
+        return replace(consolidated_check, reason=reason)
+
+    if standalone_check.passed:
+        return replace(
+            standalone_check,
+            reason=(
+                f"Standalone passed after consolidated failed. "
+                f"Standalone: {standalone_check.reason} "
+                f"Consolidated failed: {consolidated_check.reason}"
+            ),
+        )
+
+    return replace(
+        standalone_check,
+        reason=(
+            f"Consolidated failed: {consolidated_check.reason} "
+            f"Standalone failed: {standalone_check.reason}"
+        ),
+    )
+
+
+def evaluate_stock(
+    stock,
+    html,
+    years,
+    growth_threshold,
+    metric_threshold,
+    market_cap_threshold,
+    standalone_html=None,
+    standalone_error=None,
+):
     screener_company_name, tables, top_ratios = parse_screener_tables(html)
     company_name = stock.company_name or screener_company_name
     market_cap_cr, market_cap_passed, market_cap_reason = check_market_cap(
@@ -503,13 +578,16 @@ def evaluate_stock(stock, html, years, growth_threshold, metric_threshold, marke
         market_cap_threshold,
     )
 
-    profit_loss = tables.get("profit-loss", [])
-    sales_row = find_row(profit_loss, ("Sales +", "Sales", "Revenue +", "Revenue"))
-    sales_check = check_growth_series(
-        years=table_years(profit_loss),
-        values=row_values(sales_row),
-        periods=years,
-        threshold=growth_threshold,
+    consolidated_sales_check = sales_growth_check(tables, years, growth_threshold)
+    standalone_sales_check = None
+    if standalone_html:
+        _, standalone_tables, _ = parse_screener_tables(standalone_html)
+        standalone_sales_check = sales_growth_check(standalone_tables, years, growth_threshold)
+
+    sales_check = choose_sales_check(
+        consolidated_check=consolidated_sales_check,
+        standalone_check=standalone_sales_check,
+        standalone_error=standalone_error,
     )
 
     is_financial = detect_financial(stock, tables)
@@ -561,9 +639,11 @@ def failed_sales_points(check, threshold):
     if len(check.years) < 2:
         return points
 
+    exempt_years = set(check.exempt_growth_years)
     for index, growth in enumerate(check.growth_rates):
-        if growth < threshold:
-            points.append(f"{year_label(check.years[index + 1])}->{format_pct(growth)}")
+        year = check.years[index + 1]
+        if growth < threshold and year not in exempt_years:
+            points.append(f"{year_label(year)}->{format_pct(growth)}")
 
     return points
 
@@ -819,6 +899,32 @@ def process_stocks(args):
                 metric_threshold=args.return_threshold,
                 market_cap_threshold=args.min_market_cap,
             )
+            if not result.sales_check.passed:
+                standalone_html = None
+                standalone_error = None
+                try:
+                    standalone_html = load_or_fetch_screener_html(
+                        session=session,
+                        symbol=stock.symbol,
+                        data_dir=args.data_dir,
+                        fetch_missing=not args.no_fetch,
+                        refresh_days=args.refresh_days,
+                        timeout=args.timeout,
+                        consolidated=False,
+                    )
+                except Exception as exc:
+                    standalone_error = str(exc)
+
+                result = evaluate_stock(
+                    stock=stock,
+                    html=html,
+                    years=args.years,
+                    growth_threshold=args.sales_growth,
+                    metric_threshold=args.return_threshold,
+                    market_cap_threshold=args.min_market_cap,
+                    standalone_html=standalone_html,
+                    standalone_error=standalone_error,
+                )
             status = "PASS" if result.passed else "FAIL"
             if result.passed:
                 print(f"[{index}/{len(stocks)}] {stock.symbol}: {status}", flush=True)

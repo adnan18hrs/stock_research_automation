@@ -1,0 +1,6 @@
+# Passed stocks for PAT growth + EPS high + PE low strategy
+# Generated: 2026-07-10 23:42:48
+# Count: 2
+
+BLS
+ORIANA

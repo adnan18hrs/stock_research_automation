@@ -11,6 +11,7 @@ For every month-start date, this script:
 6. Compares that return with NIFTY 50 over the same period.
 7. Also values every invested portfolio at today's/latest available price.
 8. Compares staggered portfolio cashflows with the same staggered NIFTY 50 cashflows.
+9. Writes yearly cohort summaries and annual anniversary returns for each portfolio.
 
 Default run:
     python3 scripts/backtest_rsi_multiframe_screener.py
@@ -42,7 +43,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_SYMBOLS_FILE = PROJECT_ROOT / "config" / "Ticker_List_NSE_India_2000.csv"
 DEFAULT_OUTPUT_CSV = PROJECT_ROOT / "data" / "rsi_multiframe_backtest_results.csv"
 DEFAULT_TRADES_CSV = PROJECT_ROOT / "data" / "rsi_multiframe_backtest_trades.csv"
+DEFAULT_YEARLY_SUMMARY_CSV = PROJECT_ROOT / "data" / "rsi_multiframe_yearly_summary.csv"
+DEFAULT_POST_JULY_2025_SUMMARY_CSV = PROJECT_ROOT / "data" / "rsi_multiframe_post_july_2025_summary.csv"
 NIFTY_50_SYMBOL = "^NSEI"
+DEFAULT_POST_JULY_2025_START = "2025-07-01"
 DEFAULT_REQUIRED_HISTORY_MONTHS = 14
 DEFAULT_MIN_HISTORY_TRADING_DAYS = 200
 try:
@@ -99,7 +103,7 @@ def parse_args() -> argparse.Namespace:
         description="Backtest stocks passing weekly/monthly high RSI and daily low RSI."
     )
     parser.add_argument("--symbols-file", type=Path, default=DEFAULT_SYMBOLS_FILE)
-    parser.add_argument("--start-date", default="2023-03-01")
+    parser.add_argument("--start-date", default="2015-01-01")
     parser.add_argument(
         "--end-date",
         default=None,
@@ -138,6 +142,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output-csv", type=Path, default=DEFAULT_OUTPUT_CSV)
     parser.add_argument("--trades-csv", type=Path, default=DEFAULT_TRADES_CSV)
+    parser.add_argument("--yearly-summary-csv", type=Path, default=DEFAULT_YEARLY_SUMMARY_CSV)
+    parser.add_argument("--post-july-2025-summary-csv", type=Path, default=DEFAULT_POST_JULY_2025_SUMMARY_CSV)
+    parser.add_argument(
+        "--post-july-2025-start",
+        default=DEFAULT_POST_JULY_2025_START,
+        help="Start date for the post-July-2025 current-period summary. Default: 2025-07-01.",
+    )
     parser.add_argument(
         "--include-non-eq",
         action="store_true",
@@ -200,6 +211,13 @@ def add_one_year(value: date) -> date:
         return value.replace(year=value.year + 1)
     except ValueError:
         return value.replace(year=value.year + 1, day=28)
+
+
+def same_month_day_in_year(value: date, year: int) -> date:
+    try:
+        return value.replace(year=year)
+    except ValueError:
+        return value.replace(year=year, day=28)
 
 
 def latest_month_start(today: date) -> date:
@@ -411,7 +429,7 @@ def run_backtest(
                     ),
                 )
             )
-            print_month_result(rows[-1])
+            print_month_result(rows[-1], valuation_date)
             continue
 
         one_year_final_value = 0.0
@@ -504,7 +522,7 @@ def run_backtest(
                     ),
                 )
             )
-            print_month_result(rows[-1])
+            print_month_result(rows[-1], valuation_date)
             continue
 
         initial_value = investment_per_stock * invested_count
@@ -560,7 +578,7 @@ def run_backtest(
                 stocks=passed,
             )
         )
-        print_month_result(rows[-1])
+        print_month_result(rows[-1], valuation_date)
 
     return rows, trades
 
@@ -653,7 +671,7 @@ def fmt_money(value: float | None) -> str:
     return "N/A" if value is None else f"Rs {value:.2f}"
 
 
-def print_month_result(row: BacktestRow) -> None:
+def print_month_result(row: BacktestRow, valuation_date: date) -> None:
     heading = (
         f"{format_date(row.start_date)} "
         f"(eligible {row.history_eligible_count}, excluded no 14m data "
@@ -662,39 +680,112 @@ def print_month_result(row: BacktestRow) -> None:
     if row.skipped_reason:
         print(f"{heading}: skipped - {row.skipped_reason}")
         return
-    one_year_text = (
-        f"return till {format_date(row.exit_date)} if invested Rs 100 in each is total "
-        f"{fmt_pct(row.portfolio_return_pct)} return; NIFTY 50 gave {fmt_pct(row.nifty_return_pct)}; "
-        f"alpha {fmt_pct(row.alpha_pct)}"
-    )
+
+    if row.exit_date <= valuation_date:
+        one_year_text = (
+            f"1Y till {format_date(row.exit_date)}: portfolio {fmt_pct(row.portfolio_return_pct)}, "
+            f"NIFTY 50 {fmt_pct(row.nifty_return_pct)}, alpha {fmt_pct(row.alpha_pct)}"
+        )
+    else:
+        one_year_text = (
+            f"1Y not complete; partial till {format_date(valuation_date)}: "
+            f"portfolio {fmt_pct(row.current_return_pct)}, NIFTY 50 {fmt_pct(row.current_nifty_return_pct)}, "
+            f"alpha {fmt_pct(row.current_alpha_pct)}"
+        )
+
     current_text = (
-        f"from portfolio date till now: current value Rs {row.current_value:.2f} on invested Rs "
-        f"{row.current_valued_count * 100:.2f}; portfolio P/L {fmt_pct(row.current_return_pct)}; "
-        f"portfolio CAGR {fmt_pct(row.current_cagr_pct)}; NIFTY value "
-        f"{fmt_money(row.current_nifty_value)}; NIFTY 50 {fmt_pct(row.current_nifty_return_pct)}; "
-        f"NIFTY CAGR {fmt_pct(row.current_nifty_cagr_pct)}; alpha {fmt_pct(row.current_alpha_pct)}"
+        f"from {format_date(row.start_date)} till {format_date(valuation_date)}: "
+        f"portfolio total return {fmt_pct(row.current_return_pct)}; "
+        f"portfolio CAGR {fmt_pct(row.current_cagr_pct)}; "
+        f"NIFTY 50 total return {fmt_pct(row.current_nifty_return_pct)}; "
+        f"NIFTY 50 CAGR {fmt_pct(row.current_nifty_cagr_pct)}; "
+        f"current alpha {fmt_pct(row.current_alpha_pct)}"
     )
     print(f"{heading}: {one_year_text}; {current_text}.")
 
 
-def print_current_summary(rows: list[BacktestRow], investment_per_stock: float, valuation_date: date) -> None:
+def build_annual_return_texts(
+    rows: list[BacktestRow],
+    trades_df: pd.DataFrame,
+    adjusted_by_symbol: dict[str, pd.Series],
+    valuation_date: date,
+    investment_per_stock: float,
+    min_stocks: int,
+) -> dict[str, str]:
+    if trades_df.empty:
+        return {}
+
+    annual_text_by_start: dict[str, str] = {}
+
+    for row in rows:
+        if row.passed_count == 0:
+            continue
+
+        start_key = row.start_date.isoformat()
+        row_trades = trades_df[trades_df["portfolio_start_date"] == start_key]
+
+        if row_trades.empty:
+            continue
+
+        parts: list[str] = []
+        for year in range(row.start_date.year + 1, valuation_date.year + 1):
+            target_date = same_month_day_in_year(row.start_date, year)
+            if target_date > valuation_date:
+                continue
+
+            value = 0.0
+            valued_count = 0
+
+            for _, trade in row_trades.iterrows():
+                symbol = str(trade["symbol"])
+                series = adjusted_by_symbol.get(symbol)
+                if series is None or series.empty:
+                    continue
+
+                price = first_price_on_or_after(series, target_date)
+                if price is None:
+                    continue
+
+                _, target_price = price
+                quantity = float(trade["quantity"])
+                value += quantity * target_price
+                valued_count += 1
+
+            if valued_count >= min_stocks:
+                invested = investment_per_stock * valued_count
+                return_pct = ((value / invested) - 1) * 100
+                parts.append(f"{year}: {return_pct:.2f}%")
+
+        annual_text_by_start[start_key] = (
+            ", ".join(parts) + f" (from {row.start_date.year})" if parts else f"(from {row.start_date.year})"
+        )
+
+    return annual_text_by_start
+
+
+def build_combined_summary(
+    rows: list[BacktestRow],
+    investment_per_stock: float,
+    valuation_date: date,
+    label: str,
+) -> dict[str, object] | None:
     valued_rows = [
         row
         for row in rows
         if row.current_return_pct is not None and row.current_valued_count > 0 and row.current_nifty_value is not None
     ]
     if not valued_rows:
-        print("\nCurrent portfolio summary: no current portfolio rows available.")
-        return
+        return None
 
     total_invested = sum(investment_per_stock * row.current_valued_count for row in valued_rows)
     total_current_value = sum(row.current_value for row in valued_rows)
     total_nifty_value = sum(float(row.current_nifty_value) for row in valued_rows)
-    total_profit_loss = total_current_value - total_invested
-    total_nifty_profit_loss = total_nifty_value - total_invested
     total_return_pct = (total_current_value / total_invested - 1) * 100
     total_nifty_return_pct = (total_nifty_value / total_invested - 1) * 100
     alpha_pct = total_return_pct - total_nifty_return_pct
+
+    first_start_date = min(row.start_date for row in valued_rows)
+    last_start_date = max(row.start_date for row in valued_rows)
 
     portfolio_cashflows = [(row.start_date, -(investment_per_stock * row.current_valued_count)) for row in valued_rows]
     portfolio_cashflows.append((valuation_date, total_current_value))
@@ -704,32 +795,100 @@ def print_current_summary(rows: list[BacktestRow], investment_per_stock: float, 
 
     portfolio_xirr = xirr_pct(portfolio_cashflows)
     nifty_xirr = xirr_pct(nifty_cashflows)
+    portfolio_simple_cagr = cagr_pct(first_start_date, valuation_date, total_return_pct)
+    nifty_simple_cagr = cagr_pct(first_start_date, valuation_date, total_nifty_return_pct)
+
+    return {
+        "label": label,
+        "first_portfolio_start": first_start_date.isoformat(),
+        "last_portfolio_start": last_start_date.isoformat(),
+        "valuation_date": valuation_date.isoformat(),
+        "portfolio_rows": len(valued_rows),
+        "total_stock_buys": sum(row.current_valued_count for row in valued_rows),
+        "total_invested": round(total_invested, 2),
+        "portfolio_current_value": round(total_current_value, 2),
+        "portfolio_total_return_pct": round(total_return_pct, 4),
+        "portfolio_cashflow_cagr_pct": None if portfolio_xirr is None else round(portfolio_xirr, 4),
+        "portfolio_simple_cagr_from_first_buy_pct": (
+            None if portfolio_simple_cagr is None else round(portfolio_simple_cagr, 4)
+        ),
+        "nifty50_current_value": round(total_nifty_value, 2),
+        "nifty50_total_return_pct": round(total_nifty_return_pct, 4),
+        "nifty50_cashflow_cagr_pct": None if nifty_xirr is None else round(nifty_xirr, 4),
+        "nifty50_simple_cagr_from_first_buy_pct": None if nifty_simple_cagr is None else round(nifty_simple_cagr, 4),
+        "alpha_total_return_pct": round(alpha_pct, 4),
+    }
+
+
+def build_yearly_summary(
+    rows: list[BacktestRow],
+    investment_per_stock: float,
+    valuation_date: date,
+) -> pd.DataFrame:
+    records: list[dict[str, object]] = []
+
+    for formation_year in sorted({row.start_date.year for row in rows}):
+        year_rows = [row for row in rows if row.start_date.year == formation_year]
+        summary = build_combined_summary(
+            year_rows,
+            investment_per_stock,
+            valuation_date,
+            label=f"{formation_year} portfolios",
+        )
+        if summary is None:
+            continue
+        records.append({"formation_year": formation_year, **summary})
+
+    return pd.DataFrame(records)
+
+
+def print_current_summary(rows: list[BacktestRow], investment_per_stock: float, valuation_date: date) -> None:
+    summary = build_combined_summary(rows, investment_per_stock, valuation_date, "All portfolios combined")
+    if summary is None:
+        print("\nCurrent portfolio summary: no current portfolio rows available.")
+        return
 
     print("\nCurrent combined portfolio vs same cashflows in NIFTY 50")
     print(f"Valuation date: {format_date(valuation_date)}")
-    print(f"Portfolio rows valued: {len(valued_rows)}")
-    print(f"Total stock buys valued today: {sum(row.current_valued_count for row in valued_rows)}")
-    print(f"Total invested: Rs {total_invested:.2f}")
-    print(f"Portfolio current value: Rs {total_current_value:.2f}")
-    print(f"Portfolio profit/loss: Rs {total_profit_loss:.2f}")
-    print(f"Portfolio total return: {total_return_pct:.2f}%")
-    print(f"Portfolio XIRR: {fmt_pct(portfolio_xirr)}")
-    print(f"NIFTY 50 current value for same cashflows: Rs {total_nifty_value:.2f}")
-    print(f"NIFTY 50 profit/loss for same cashflows: Rs {total_nifty_profit_loss:.2f}")
-    print(f"NIFTY 50 total return for same cashflows: {total_nifty_return_pct:.2f}%")
-    print(f"NIFTY 50 XIRR for same cashflows: {fmt_pct(nifty_xirr)}")
-    print(f"Total alpha vs NIFTY 50: {alpha_pct:.2f}%")
+    print(f"Portfolio rows valued: {summary['portfolio_rows']}")
+    print(f"Total stock buys valued today: {summary['total_stock_buys']}")
+    print(f"Portfolio total return: {summary['portfolio_total_return_pct']:.2f}%")
+    print(f"Portfolio cashflow CAGR/XIRR: {fmt_pct(summary['portfolio_cashflow_cagr_pct'])}")
+    print(f"NIFTY 50 total return for same cashflows: {summary['nifty50_total_return_pct']:.2f}%")
+    print(f"NIFTY 50 cashflow CAGR/XIRR: {fmt_pct(summary['nifty50_cashflow_cagr_pct'])}")
+    print(f"Total alpha vs NIFTY 50: {summary['alpha_total_return_pct']:.2f}%")
 
 
-def write_outputs(rows: list[BacktestRow], trades: list[dict[str, object]], output_csv: Path, trades_csv: Path) -> None:
-    output_csv.parent.mkdir(parents=True, exist_ok=True)
-    trades_csv.parent.mkdir(parents=True, exist_ok=True)
+def build_results_frame(
+    rows: list[BacktestRow],
+    investment_per_stock: float,
+    valuation_date: date,
+    annual_return_text_by_start: dict[str, str],
+) -> pd.DataFrame:
+    records: list[dict[str, object]] = []
 
-    pd.DataFrame(
-        [
+    for row in rows:
+        if row.passed_count == 0:
+            continue
+
+        use_one_year = row.exit_date <= valuation_date and row.portfolio_return_pct is not None
+        effective_end_date = row.exit_date if use_one_year else valuation_date
+        effective_portfolio_return_pct = row.portfolio_return_pct if use_one_year else row.current_return_pct
+        effective_nifty_return_pct = row.nifty_return_pct if use_one_year else row.current_nifty_return_pct
+        effective_alpha_pct = (
+            None
+            if effective_portfolio_return_pct is None or effective_nifty_return_pct is None
+            else effective_portfolio_return_pct - effective_nifty_return_pct
+        )
+
+        records.append(
             {
                 "start_date": row.start_date.isoformat(),
+                "formation_year": row.start_date.year,
                 "exit_date": row.exit_date.isoformat(),
+                "valuation_date": valuation_date.isoformat(),
+                "one_year_complete": bool(use_one_year),
+                "effective_return_end_date": effective_end_date.isoformat(),
                 "history_eligible_count": row.history_eligible_count,
                 "insufficient_14m_history_count": row.insufficient_history_count,
                 "passed_count": row.passed_count,
@@ -751,13 +910,38 @@ def write_outputs(rows: list[BacktestRow], trades: list[dict[str, object]], outp
                     None if row.current_nifty_cagr_pct is None else round(row.current_nifty_cagr_pct, 4)
                 ),
                 "current_alpha_pct": None if row.current_alpha_pct is None else round(row.current_alpha_pct, 4),
+                "effective_portfolio_return_pct": (
+                    None if effective_portfolio_return_pct is None else round(effective_portfolio_return_pct, 4)
+                ),
+                "effective_nifty50_return_pct": (
+                    None if effective_nifty_return_pct is None else round(effective_nifty_return_pct, 4)
+                ),
+                "effective_alpha_pct": None if effective_alpha_pct is None else round(effective_alpha_pct, 4),
+                "annual_portfolio_returns": annual_return_text_by_start.get(row.start_date.isoformat(), ""),
                 "stocks": ",".join(row.stocks),
                 "skipped_reason": row.skipped_reason,
             }
-            for row in rows
-        ]
-    ).to_csv(output_csv, index=False)
+        )
 
+    return pd.DataFrame(records)
+
+
+def write_outputs(
+    rows: list[BacktestRow],
+    trades: list[dict[str, object]],
+    output_csv: Path,
+    trades_csv: Path,
+    annual_return_text_by_start: dict[str, str],
+    investment_per_stock: float,
+    valuation_date: date,
+) -> None:
+    output_csv.parent.mkdir(parents=True, exist_ok=True)
+    trades_csv.parent.mkdir(parents=True, exist_ok=True)
+
+    build_results_frame(rows, investment_per_stock, valuation_date, annual_return_text_by_start).to_csv(
+        output_csv,
+        index=False,
+    )
     pd.DataFrame(trades).to_csv(trades_csv, index=False)
 
 
@@ -776,6 +960,7 @@ def main() -> int:
             if args.valuation_date
             else date.today()
         )
+        post_july_2025_start = datetime.strptime(args.post_july_2025_start, "%Y-%m-%d").date()
     except ValueError as exc:
         print(f"Invalid date. Use YYYY-MM-DD. {exc}", file=sys.stderr)
         return 2
@@ -803,6 +988,7 @@ def main() -> int:
     print(f"Loaded {len(symbols)} stock symbols from {args.symbols_file}")
     print(f"Backtesting {len(month_starts)} monthly portfolios from {format_date(month_starts[0])} to {format_date(month_starts[-1])}")
     print(f"Current valuation date: {format_date(valuation_date)}")
+    print(f"Post-July-2025 summary starts from: {format_date(post_july_2025_start)}")
     print(
         f"Required stock history: at least {args.required_history_months} months before each "
         f"portfolio date, with minimum {args.min_history_trading_days} trading days in that window"
@@ -832,11 +1018,49 @@ def main() -> int:
         required_history_months=args.required_history_months,
         min_history_trading_days=args.min_history_trading_days,
     )
-    write_outputs(rows, trades, args.output_csv, args.trades_csv)
+
+    trades_df = pd.DataFrame(trades)
+    annual_return_text_by_start = build_annual_return_texts(
+        rows=rows,
+        trades_df=trades_df,
+        adjusted_by_symbol=adjusted_by_symbol,
+        valuation_date=valuation_date,
+        investment_per_stock=args.investment_per_stock,
+        min_stocks=args.min_stocks,
+    )
+    write_outputs(
+        rows,
+        trades,
+        args.output_csv,
+        args.trades_csv,
+        annual_return_text_by_start,
+        args.investment_per_stock,
+        valuation_date,
+    )
+
+    yearly_summary = build_yearly_summary(rows, args.investment_per_stock, valuation_date)
+    args.yearly_summary_csv.parent.mkdir(parents=True, exist_ok=True)
+    yearly_summary.to_csv(args.yearly_summary_csv, index=False)
+
+    post_july_rows = [row for row in rows if row.start_date >= post_july_2025_start]
+    post_july_summary = build_combined_summary(
+        post_july_rows,
+        args.investment_per_stock,
+        valuation_date,
+        label=f"Portfolios from {post_july_2025_start.isoformat()} onward",
+    )
+    args.post_july_2025_summary_csv.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame([] if post_july_summary is None else [post_july_summary]).to_csv(
+        args.post_july_2025_summary_csv,
+        index=False,
+    )
+
     print_current_summary(rows, args.investment_per_stock, valuation_date)
 
     print(f"\nSummary CSV: {args.output_csv}")
     print(f"Trade CSV: {args.trades_csv}")
+    print(f"Yearly summary CSV: {args.yearly_summary_csv}")
+    print(f"Post-July-2025 summary CSV: {args.post_july_2025_summary_csv}")
     return 0
 
 
