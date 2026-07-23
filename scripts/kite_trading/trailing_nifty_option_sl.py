@@ -41,6 +41,7 @@ PHASE_ONE_GAP_FACTOR = 0.05
 TRAIL_FACTOR_AFTER_10_PCT = 2.0 / 3.0
 TRIGGER_GAP_FACTOR = 0.005
 OPEN_SL_STATUSES = {"TRIGGER PENDING", "OPEN", "MODIFY PENDING", "MODIFY VALIDATION PENDING"}
+TRANSIENT_SL_STATUSES = {"CANCEL PENDING", "CANCEL VALIDATION PENDING"}
 
 
 def price_to_tick(price: float) -> float:
@@ -241,6 +242,111 @@ def wait_for_emergency_exit_completion(
     )
 
 
+def cancel_sl_and_confirm_terminal(
+    client: KiteClient, *, order_id: str, timeout_seconds: int
+) -> str:
+    """Cancel an unfilled SL before a replacement market exit is sent."""
+    try:
+        client._request("DELETE", f"/orders/regular/{order_id}")
+    except KiteApiError:
+        # The SL can fill in the short interval before Kite processes cancellation.
+        status_after_cancel_error = str(latest_order(client, order_id).get("status") or "UNKNOWN")
+        if status_after_cancel_error in {"COMPLETE", "CANCELLED", "REJECTED"}:
+            return status_after_cancel_error
+        raise
+    deadline = time.monotonic() + timeout_seconds
+    last_status = "UNKNOWN"
+    while time.monotonic() < deadline:
+        last_status = str(latest_order(client, order_id).get("status") or "UNKNOWN")
+        if last_status == "COMPLETE":
+            return last_status
+        if last_status in {"CANCELLED", "REJECTED"}:
+            return last_status
+        time.sleep(0.5)
+    raise KiteApiError(
+        f"SL cancellation for {order_id} was not confirmed within {timeout_seconds}s "
+        f"(last status={last_status})."
+    )
+
+
+def net_position_quantity(
+    client: KiteClient, *, exchange: str, tradingsymbol: str, product: str
+) -> int:
+    """Return the actual live net quantity before issuing any replacement exit."""
+    positions = client._request("GET", "/portfolio/positions")
+    matching = [
+        item
+        for item in positions.get("net", [])
+        if item.get("exchange") == exchange
+        and item.get("tradingsymbol") == tradingsymbol
+        and item.get("product") == product
+    ]
+    return sum(int(item.get("quantity") or 0) for item in matching)
+
+
+def emergency_exit_after_unfilled_sl(
+    client: KiteClient,
+    *,
+    sl_order_id: str,
+    sl_status: str,
+    exchange: str,
+    tradingsymbol: str,
+    expected_quantity: int,
+    product: str,
+    market_protection: float,
+    cancel_timeout_seconds: int,
+    exit_timeout_seconds: int,
+) -> bool:
+    """Safely replace a failed/unfilled SL with a verified market exit.
+
+    Returns True only when an emergency exit is confirmed complete. A pending
+    SL is cancelled and its terminal state confirmed first, preventing a
+    duplicate sell if it fills while the replacement is being prepared.
+    """
+    if sl_status in OPEN_SL_STATUSES:
+        terminal_status = cancel_sl_and_confirm_terminal(
+            client, order_id=sl_order_id, timeout_seconds=cancel_timeout_seconds
+        )
+        if terminal_status == "COMPLETE":
+            LOG.warning("SL %s filled while cancelling; no emergency exit required.", sl_order_id)
+            return False
+    elif sl_status not in {"CANCELLED", "REJECTED"}:
+        raise KiteApiError(f"Cannot safely replace SL {sl_order_id} with status={sl_status}.")
+
+    quantity = net_position_quantity(
+        client, exchange=exchange, tradingsymbol=tradingsymbol, product=product
+    )
+    if quantity == 0:
+        LOG.warning("No open position remains for %s:%s; no emergency exit required.", exchange, tradingsymbol)
+        return False
+    if quantity != expected_quantity:
+        raise KiteApiError(
+            f"Expected one-lot long quantity {expected_quantity}, but live net position is {quantity}; "
+            "refusing automatic exit."
+        )
+    emergency_order_id = submit_emergency_market_exit(
+        client,
+        exchange=exchange,
+        tradingsymbol=tradingsymbol,
+        quantity=quantity,
+        product=product,
+        market_protection=market_protection,
+    )
+    average_price = wait_for_emergency_exit_completion(
+        client,
+        order_id=emergency_order_id,
+        quantity=quantity,
+        timeout_seconds=exit_timeout_seconds,
+    )
+    LOG.critical(
+        "Emergency exit CONFIRMED COMPLETE: order=%s quantity=%s avg_price=%.2f.",
+        emergency_order_id,
+        quantity,
+        average_price,
+    )
+    return True
+
+
 def prompt_for_signal() -> str:
     print("\nReady. Entry will happen only after your choice.")
     print("1 = Buy 1 NIFTY CE lot and start trailing SL")
@@ -263,6 +369,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--market-protection", type=float, default=-1)
     parser.add_argument("--order-timeout", type=int, default=20)
     parser.add_argument("--emergency-exit-timeout", type=int, default=20)
+    parser.add_argument("--sl-cancel-timeout", type=int, default=5)
     parser.add_argument("--poll-seconds", type=float, default=1.0, help="LTP/SL check interval; minimum 1 second.")
     parser.add_argument("--instrument-cache", type=Path, default=DEFAULT_INSTRUMENT_CACHE)
     parser.add_argument("--refresh-instruments", action="store_true")
@@ -283,6 +390,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         raise SystemExit("--poll-seconds must be at least 1 second.")
     if args.emergency_exit_timeout < 1:
         raise SystemExit("--emergency-exit-timeout must be at least 1 second.")
+    if args.sl_cancel_timeout < 1:
+        raise SystemExit("--sl-cancel-timeout must be at least 1 second.")
     if args.execute != args.i_understand_live_risk:
         raise SystemExit("Live trading requires both --execute and --i-understand-live-risk.")
     if args.log_file is None:
@@ -424,11 +533,45 @@ def main(argv: Optional[List[str]] = None) -> int:
     current_limit = initial_limit
     while True:
         if client.execute:
-            status = latest_order(client, sl_order_id).get("status")
-            if status not in OPEN_SL_STATUSES:
-                LOG.warning("Stopping: SL order is no longer pending (status=%s).", status)
+            sl_order = latest_order(client, sl_order_id)
+            status = str(sl_order.get("status") or "UNKNOWN")
+            if status == "COMPLETE":
+                LOG.warning("Stopping: Kite SL is complete; position has been exited.")
                 return 0
+            if status in TRANSIENT_SL_STATUSES:
+                LOG.warning("SL has transient status=%s; waiting for Kite update.", status)
+                time.sleep(args.poll_seconds)
+                continue
         current_ltp = get_option_ltp(client, instrument, args.paper_option_ltp)
+        live_trigger = float(sl_order.get("trigger_price") or 0) if client.execute else 0.0
+        sl_needs_emergency_exit = (
+            client.execute
+            and (
+                status in {"CANCELLED", "REJECTED"}
+                or (status in OPEN_SL_STATUSES and live_trigger > 0 and current_ltp <= live_trigger)
+            )
+        )
+        if sl_needs_emergency_exit:
+            LOG.critical(
+                "SL protection failed/unfilled: status=%s CP=%.2f trigger=%.2f. "
+                "Cancelling any pending SL and preparing emergency exit.",
+                status,
+                current_ltp,
+                live_trigger,
+            )
+            emergency_exit_after_unfilled_sl(
+                client,
+                sl_order_id=sl_order_id,
+                sl_status=status,
+                exchange=instrument.exchange,
+                tradingsymbol=instrument.tradingsymbol,
+                expected_quantity=quantity,
+                product=args.product,
+                market_protection=args.market_protection,
+                cancel_timeout_seconds=args.sl_cancel_timeout,
+                exit_timeout_seconds=args.emergency_exit_timeout,
+            )
+            return 0
         highest_ltp = max(highest_ltp, current_ltp)
         target_trigger, target_limit = stop_prices(entry_price, highest_ltp)
         if target_limit > current_limit:

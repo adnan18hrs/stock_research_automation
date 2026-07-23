@@ -48,6 +48,13 @@ python3 trailing_nifty_option_sl.py --execute --i-understand-live-risk
 
 `Ctrl-C` stops the script but leaves the last SL active at Kite.
 
+If a triggered SELL `SL` remains unfilled (`OPEN`) while the option LTP is at
+or below its trigger, or if Kite marks the SL `CANCELLED`/`REJECTED`, the script
+cancels any still-pending SL, verifies that one long lot is actually open, and
+then submits and confirms a protected SELL MARKET emergency exit. It does not
+send that market order if the SL cancellation/status is uncertain, preventing a
+duplicate sell.
+
 For an entry of Rs. 100, SL **limit** prices follow this path (the trigger is
 Rs. 0.50 above the limit):
 
