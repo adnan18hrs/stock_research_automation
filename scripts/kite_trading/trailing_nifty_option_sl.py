@@ -48,6 +48,14 @@ def price_to_tick(price: float) -> float:
     return round(round(price / TICK_SIZE) * TICK_SIZE, 2)
 
 
+def trigger_points_from_entry(entry_price: float, trigger_price: float) -> str:
+    """Format the SL trigger's signed point distance from the actual buy price."""
+    points = round(trigger_price - entry_price, 2)
+    if abs(points - round(points)) < 0.005:
+        return f"{points:+.0f}"
+    return f"{points:+.2f}"
+
+
 def trailing_limit_price(entry_price: float, highest_ltp: float) -> float:
     """Return the limit SL from the requested two-stage trailing rule."""
     initial_limit = price_to_tick(entry_price * INITIAL_SL_LIMIT_FACTOR)
@@ -580,13 +588,22 @@ def main(argv: Optional[List[str]] = None) -> int:
             )
             current_limit = target_limit
             LOG.warning(
-                "SL raised: CP=%.2f high=%.2f -> trigger=%.2f limit=%.2f (order=%s)",
-                current_ltp, highest_ltp, target_trigger, target_limit, modified_id,
+                "SL raised(%s): CP=%.2f high=%.2f -> trigger=%.2f limit=%.2f (order=%s)",
+                trigger_points_from_entry(entry_price, target_trigger),
+                current_ltp,
+                highest_ltp,
+                target_trigger,
+                target_limit,
+                modified_id,
             )
         else:
             LOG.info(
-                "No SL change: CP=%.2f high=%.2f current_limit=%.2f target_limit=%.2f",
-                current_ltp, highest_ltp, current_limit, target_limit,
+                "No SL change(%s): CP=%.2f high=%.2f current_limit=%.2f target_limit=%.2f",
+                trigger_points_from_entry(entry_price, target_trigger),
+                current_ltp,
+                highest_ltp,
+                current_limit,
+                target_limit,
             )
         time.sleep(args.poll_seconds)
 
